@@ -1,0 +1,7 @@
+psycopg2-binary
+geoalchemy2
+sqlalchemy
+pydantic
+fastapi
+uvicorn
+shapely

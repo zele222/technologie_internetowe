@@ -1,17 +1,33 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from fastapi.encoders import jsonable_encoder
-from models import Person, PersonCreate, PersonNameUpdate
+from fastapi.middleware.cors import CORSMiddleware
+from models import Person, PersonCreate, PersonNameUpdate, PositionUpdate
 from db_config import ORMBaseModel, db_engine, get_db_session
 from encoders import to_dict
-from typing import Union
-
+from typing import List
 import os
+import json
+from shapely import wkt
+
+app = FastAPI()
+
+# CORS (opcjonalnie)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+active_connections: list[WebSocket] = []
+
+
 ORMBaseModel.metadata.create_all(bind=db_engine)
-app = FastAPI()
+
 
 
 @app.get("/")
@@ -71,3 +87,46 @@ def delete_user(person_id: int, db_session: Session = Depends(get_db_session)):
     db_session.delete(person)
     db_session.commit()
     return jsonable_encoder({"message" : "Person deleted"})
+
+@app.websocket("/ws/positions")
+async def positions(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Utrzymanie połączenia
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
+
+@app.put("/people/{person_id}/position")
+async def update_position(person_id: int, position_update: PositionUpdate, db_session: Session = Depends(get_db_session)):
+    from geoalchemy2.shape import to_shape
+    from shapely import wkt
+    import json
+
+    person = db_session.query(Person).filter(Person.id == person_id).first()
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    
+    # Przypisanie nowej pozycji w formacie WKT
+    geom = wkt.loads(position_update.position)
+    person.position = position_update.position
+    person.latitude = geom.y
+    person.longitude = geom.x
+    db_session.commit()
+    db_session.refresh(person)
+
+    # Wiadomość do klientów WebSocket
+    message = json.dumps({
+        "id": person.id,
+        "lat": person.latitude,
+        "lon": person.longitude,
+        "first_name": person.first_name,
+        "last_name": person.last_name,
+        "person_type_id": person.person_type_id
+    })
+
+    for connection in active_connections:
+        await connection.send_text(message)
+
+    return {"message": "Position updated"}

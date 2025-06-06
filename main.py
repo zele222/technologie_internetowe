@@ -1,122 +1,80 @@
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
-from sqlalchemy.orm import Session
-from fastapi.encoders import jsonable_encoder
-from fastapi.middleware.cors import CORSMiddleware
-from models import Person, PersonCreate, PersonNameUpdate, PositionUpdate
-from db_config import ORMBaseModel, db_engine, get_db_session
-from encoders import to_dict
-from typing import List
 import os
 import json
-from shapely import wkt
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
+from models import Person, PersonCreate, PositionUpdate
+from db_config import get_db_session, ORMBaseModel, db_engine
+from encoders import to_dict
+from fastapi.middleware.cors import CORSMiddleware  # <-- Dodaj to
+
+
+# Tworzenie tabel przy starcie
+ORMBaseModel.metadata.create_all(bind=db_engine)
 
 app = FastAPI()
-
-# CORS (opcjonalnie)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # <-- zezwala na wszystkie domeny
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+router = APIRouter()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
+# Lista aktywnych WebSocketów
 active_connections: list[WebSocket] = []
 
+@router.post("/person/")
+def create_person(person: PersonCreate, db: Session = Depends(get_db_session)):
+    db_person = Person(**person.dict())
+    db.add(db_person)
+    db.commit()
+    db.refresh(db_person)
+    return to_dict(db_person)
 
-ORMBaseModel.metadata.create_all(bind=db_engine)
+@router.get("/person/")
+def read_all_persons(db: Session = Depends(get_db_session)):
+    persons = db.query(Person).all()
+    return [to_dict(p) for p in persons]
 
-
-
-@app.get("/")
-def test():
-    return {"Hello": "World"}
-
-
-@app.post("/people")
-def create_person(person_create: PersonCreate, db_session: Session=Depends(get_db_session)):
-    new_person = Person(
-        first_name = person_create.first_name,
-        last_name = person_create.last_name,
-        person_type_id = person_create.person_type_id
-    )
-    
-    db_session.add(new_person)
-    db_session.commit()
-    db_session.refresh(new_person)
-    return jsonable_encoder({
-        "id": new_person.id,
-        "first_name":new_person.first_name,
-        "last_name":new_person.last_name,
-        "person_type_id":person_create.person_type_id
-    })
-
-
-@app.get("/people")
-def get_all_people(db_session: Session = Depends(get_db_session)):
-    people = db_session.query(Person).all()
-    result = []
-    for person in people:
-        person_dict = to_dict(person)
-        result.append(person_dict)
-    return jsonable_encoder(result)
-
-@app.put("/people/{person_id}/name")
-def update_names(person_id: int, names_update: PersonNameUpdate, db_session: Session = Depends(get_db_session)):
-    person = db_session.query(Person).filter(Person.id == person_id).first()
-    if not person:
-        raise HTTPException(status_code=404,detail="Person not found")
-    person.first_name = f"first_name:{names_update.first_name}"
-    person.last_name = f"last_name:{names_update.last_name}"
-    db_session.commit()
-    db_session.refresh(person)
-    return jsonable_encoder({
-        "message": "Names updated",
-        "id": person.id,
-        "first_name": names_update.first_name,
-        "last_name": names_update.last_name
-    })
-
-@app.delete("/people/{person_id}")
-def delete_user(person_id: int, db_session: Session = Depends(get_db_session)):
-    person = db_session.query(Person).filter(Person.id == person_id).first()
-    if not person:
-        raise HTTPException(status_code=404,detail="Person not found")
-    db_session.delete(person)
-    db_session.commit()
-    return jsonable_encoder({"message" : "Person deleted"})
-
-@app.websocket("/ws/positions")
-async def positions(websocket: WebSocket):
-    await websocket.accept()
-    active_connections.append(websocket)
-    try:
-        while True:
-            await websocket.receive_text()  # Utrzymanie połączenia
-    except WebSocketDisconnect:
-        active_connections.remove(websocket)
-
-@app.put("/people/{person_id}/position")
-async def update_position(person_id: int, position_update: PositionUpdate, db_session: Session = Depends(get_db_session)):
-    from geoalchemy2.shape import to_shape
-    from shapely import wkt
-    import json
-
-    person = db_session.query(Person).filter(Person.id == person_id).first()
-    if not person:
+@router.get("/person/{person_id}")
+def read_person(person_id: int, db: Session = Depends(get_db_session)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if person is None:
         raise HTTPException(status_code=404, detail="Person not found")
-    
-    # Przypisanie nowej pozycji w formacie WKT
-    geom = wkt.loads(position_update.position)
-    person.position = position_update.position
-    person.latitude = geom.y
-    person.longitude = geom.x
-    db_session.commit()
-    db_session.refresh(person)
+    return to_dict(person)
 
-    # Wiadomość do klientów WebSocket
+@router.put("/person/{person_id}")
+def update_person(person_id: int, updated: PersonCreate, db: Session = Depends(get_db_session)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    for key, value in updated.dict().items():
+        setattr(person, key, value)
+    db.commit()
+    return to_dict(person)
+
+@router.delete("/person/{person_id}")
+def delete_person(person_id: int, db: Session = Depends(get_db_session)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    db.delete(person)
+    db.commit()
+    return {"message": f"Deleted person with ID {person_id}"}
+
+# ➕ ENDPOINT DO AKTUALIZACJI POZYCJI
+@app.put("/person/{person_id}/position")
+async def update_position(person_id: int, position: PositionUpdate, db: Session = Depends(get_db_session)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    person.latitude = position.latitude
+    person.longitude = position.longitude
+    db.commit()
+    db.refresh(person)
+
     message = json.dumps({
         "id": person.id,
         "lat": person.latitude,
@@ -129,4 +87,18 @@ async def update_position(person_id: int, position_update: PositionUpdate, db_se
     for connection in active_connections:
         await connection.send_text(message)
 
-    return {"message": "Position updated"}
+    return {"status": "position updated"}
+
+# 🌐 WEBSOCKET /ws/positions
+@app.websocket("/ws/positions")
+async def websocket_positions(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # tylko utrzymuje połączenie
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
+
+# Rejestracja routera
+app.include_router(router)
